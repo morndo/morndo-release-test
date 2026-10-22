@@ -9,3 +9,8 @@ nothing should install from it. The tree is a copy of morndo/morndo, and these f
   the way Release Please does (the org does not let Actions open pull requests, and this repository has no release app),
   and the feed and Pages jobs are left out. Every job from `build` to `published` is the pipeline's own. Release Please
   itself is not exercised here.
+
+Also differing, since they pin the production files the bench replaces: the workflows other than `release.yml` and the
+four test files that read them (`scripts/release/workflow.test.ts`, `scripts/release/signing.test.ts`,
+`apps/hub/test/val-b12-e2e-listed.test.ts`, `plugins/transcribe-whisper-cpp/test/install.test.ts`) are removed. The
+history is the branch's full history, because the downgrade-contract tests read an earlier commit.
