@@ -1,0 +1,378 @@
+#!/bin/sh
+# Reject a push that adds a secret, a home path, a private key, or a token.
+# Added lines are checked, so a marker already in a file does not fail a later
+# edit. A private-key header in a test or fixture file is a fixture. Every
+# commit the push adds is checked on its own: a plain
+# commit (a root commit against the empty tree) through its own patch, a
+# merge through its combined diff, which holds only the conflict resolution.
+# A line added and removed in two commits of the push is caught in the commit
+# that added it. gitleaks and the commit-mail checks cover the same commits,
+# so commits already on the remote you push to (its remote-tracking refs;
+# fetch first) are not checked again, and there is no exception list. A push
+# to a URL, or a remote with no tracking refs, checks everything the remote
+# tip does not already hold.
+# The push is read once, whatever it holds: the commits of all the pushed refs
+# are one selection (each commit once, though refs share it), listed with one
+# rev-list and read with one diff-tree per kind of commit; the lines they add
+# are searched in one pass, not one search per line.
+# Install with scripts/install-git-hooks.sh. Does not change git config.
+#
+# gitleaks 8.30.1 `protect` scans `git diff` (or `--staged`), not the commits
+# in the push. Those commits are scanned with `gitleaks detect --log-opts`.
+# Git passes "<local ref> <local sha> <remote ref> <remote sha>" on stdin.
+# This script is never scanned: its patterns would match their own source.
+set -eu
+# Range words are expanded unquoted below; nothing here globs filenames.
+set -f
+
+root=$(git rev-parse --show-toplevel)
+cd "$root"
+
+# $1 names the remote being pushed to, or holds the URL of the push.
+remote=${1:-}
+
+if ! command -v gitleaks >/dev/null 2>&1; then
+  echo "pre-push: gitleaks is not on PATH (https://github.com/gitleaks/gitleaks/releases/tag/v8.30.1)" >&2
+  exit 1
+fi
+
+zero=0000000000000000000000000000000000000000
+patterns=$(mktemp)
+paths=$(mktemp)
+patch=$(mktemp)
+hits=$(mktemp)
+pairs=$(mktemp)
+joined=$(mktemp)
+all=$(mktemp)
+plain=$(mktemp)
+merges=$(mktemp)
+addf=$(mktemp)
+addt=$(mktemp)
+trap 'rm -f "$patterns" "$paths" "$patch" "$hits" "$pairs" "$joined" "$all" "$plain" "$merges" "$addf" "$addt"' EXIT
+tab=$(printf '\t')
+# The rev-list arguments that select the commits the push adds, set by scan_push.
+range=''
+
+
+gitleaks protect --no-banner --redact
+
+scan_dir() {
+  gitleaks dir . --config .gitleaks.toml --redact --no-banner
+}
+
+# What the remote being pushed to already holds, as rev-list arguments: its
+# remote-tracking refs when $remote names a configured remote that has any, else
+# the remote tips the server names (the old value of each pushed ref) that this
+# clone holds, else nothing: the whole history. All of them are on the remote,
+# so one list spares every pushed ref. A second remote's tracking ref, or any
+# other local ref, spares nothing.
+published() {
+  if [ -n "$remote" ] && git remote get-url "$remote" >/dev/null 2>&1 &&
+      [ -n "$(git for-each-ref --count=1 "refs/remotes/$remote/")" ]; then
+    printf -- '--not --remotes=%s/*' "$remote"
+    return 0
+  fi
+  [ -n "$1" ] || return 0
+  printf -- '--not%s' "$1"
+}
+
+scan_push() {
+  # stdin is not a terminal when git runs this hook.
+  if [ -t 0 ]; then
+    scan_dir
+    return
+  fi
+  tips=
+  knowns=
+  while read -r local_ref local_sha remote_ref remote_sha; do
+    [ -n "${local_sha:-}" ] || continue
+    if [ "$local_sha" = "$zero" ]; then
+      continue
+    fi
+    case " $tips " in *" $local_sha "*) ;; *) tips="$tips $local_sha" ;; esac
+    if [ "$remote_sha" != "$zero" ] &&
+        git rev-parse -q --verify "$remote_sha^{commit}" >/dev/null 2>&1; then
+      case " $knowns " in *" $remote_sha "*) ;; *) knowns="$knowns $remote_sha" ;; esac
+    fi
+  done
+  if [ -z "$tips" ]; then
+    scan_dir
+    return
+  fi
+  range=${tips# }
+  spared=$(published "$knowns")
+  [ -z "$spared" ] || range="$range $spared"
+  # The same selection every check uses, scanned once.
+  gitleaks detect --no-banner --redact --log-opts="$range"
+}
+
+scan_push
+
+# Generic markers only. Extra regexes, one per line, may live outside the
+# tree at "$(git rev-parse --git-dir)/info/leak-patterns".
+self=scripts/git-hooks/pre-push
+listfile=scripts/git-hooks/leak-allowlist
+home_re='/(home|Users)/[^/[:space:]]+/'
+key_re='-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----'
+token_re='(ghp_|github_pat_|sk-|xox[baprs]-|AKIA)[A-Za-z0-9_]{16,}'
+# Exact path and exact match, tab-separated. A different match in that file still fails.
+# Resolved from this script so a proof can run it against another checkout.
+allowlist=$(dirname "$(readlink -f "$0")")/leak-allowlist
+
+allowed() {
+  [ -f "$allowlist" ] || return 1
+  needle=$(printf '%s\t%s' "$1" "$2")
+  grep -F -x -q -- "$needle" "$allowlist"
+}
+
+# 0 when a private-key header sits in a test or fixture. A home path or a
+# token in that file still fails.
+obvious_fixture() {
+  case "$1" in
+    *.test.ts|*.test.tsx|*.test.js|*.test.mjs|*.e2e.ts|*.fixture.ts|*.fixture.js) ;;
+    */test/*|*/tests/*|*/fixtures/*) ;;
+    *) return 1 ;;
+  esac
+  printf '%s' "$2" | grep -E -q '^-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----$'
+}
+
+skip_file() {
+  case "$1" in
+    "$self"|./"$self"|"$listfile"|./"$listfile") return 0 ;;
+  esac
+  return 1
+}
+
+extra=$(git rev-parse --git-dir)/info/leak-patterns
+if [ -f "$extra" ]; then
+  awk 'NF { print }' "$extra" > "$patterns"
+fi
+
+reject() {
+  echo "pre-push: $*" >&2
+  exit 1
+}
+
+search_failed() {
+  echo "pre-push: pattern search failed" >&2
+  exit 1
+}
+
+# Every added line of the push and of the working tree is appended to two
+# files, one line each: the file it is in ($addf) and its text ($addt). One
+# pass over the texts finds the matches; only the matches are looked at one by
+# one. An allowlisted or fixture match does not hide a later match, or a local
+# pattern, on that same line. A search error aborts. The searches run in the
+# caller's locale, as they always did: a dot in a local pattern is one
+# character there, ü included.
+check_added() {
+  [ -s "$addt" ] || return 0
+  status=0
+  grep -a -n -o -E -e "$home_re" -e "$key_re" -e "$token_re" "$addt" > "$hits" || status=$?
+  [ "$status" -le 1 ] || search_failed
+  if [ "$status" -eq 0 ]; then
+    # "<file><tab><match>", each pair once. No pipe: a pipeline answers with its last command, and a failing awk
+    # would leave nothing to look at and let the push through. sort compares bytes, so two matches are one only when
+    # they are the same bytes.
+    awk 'NR == FNR { f[FNR] = $0; next } { i = index($0, ":"); printf "%s\t%s\n", f[substr($0, 1, i - 1) + 0], substr($0, i + 1) }' "$addf" "$hits" > "$pairs" || search_failed
+    LC_ALL=C sort -u "$pairs" > "$joined" || search_failed
+    while IFS= read -r rec || [ -n "$rec" ]; do
+      file=${rec%%"$tab"*}
+      one=${rec#*"$tab"}
+      [ -n "$one" ] || continue
+      allowed "$file" "$one" && continue
+      obvious_fixture "$file" "$one" && continue
+      reject "home path, private key, or token in $file"
+    done < "$joined"
+  fi
+  [ -s "$patterns" ] || return 0
+  status=0
+  first=$(grep -a -n -m 1 -E -f "$patterns" "$addt") || status=$?
+  [ "$status" -ne 0 ] || reject "local leak pattern in $(sed -n "${first%%:*}p" "$addf")"
+  [ "$status" -eq 1 ] || search_failed
+}
+
+scan_file() {
+  file=$1
+  skip_file "$file" && return 0
+  status=0
+  raw=$(grep -I -o -E -e "$home_re" -e "$key_re" -e "$token_re" -- "$file") || status=$?
+  [ "$status" -le 1 ] || search_failed
+  if [ "$status" -eq 0 ]; then
+    printf '%s\n' "$raw" > "$hits"
+    while IFS= read -r one || [ -n "$one" ]; do
+      [ -n "$one" ] || continue
+      allowed "$file" "$one" && continue
+      obvious_fixture "$file" "$one" && continue
+      reject "home path, private key, or token in $file"
+    done < "$hits"
+  fi
+  [ -s "$patterns" ] || return 0
+  status=0
+  grep -I -q -E -f "$patterns" -- "$file" || status=$?
+  [ "$status" -ne 0 ] || reject "local leak pattern in $file"
+  [ "$status" -eq 1 ] || search_failed
+}
+
+# One added line, for check_added: its file on fd 3, its text on fd 4 (collect_patch opens both).
+add_line() {
+  printf '%s\n' "$1" >&3
+  printf '%s\n' "$2" >&4
+}
+
+# New-file length from a hunk header. Omitted count means one line.
+hunk_new_lines() {
+  rest=${1#*+}
+  rest=${rest%% @@*}
+  case "$rest" in
+    *,*) rest=${rest#*,} ;;
+    *) rest=1 ;;
+  esac
+  case "$rest" in
+    *[!0-9]*|'') printf '0' ;;
+    *) printf '%s' "$rest" ;;
+  esac
+}
+
+# Added lines of a unified or a combined diff. Headers are read only outside
+# a hunk, and a hunk is the number of new-file lines the header names. A
+# marker already in the file is not an added line. In a combined hunk, which
+# a merge carries, a line with a '-' column for any parent is not part of the
+# result, and only a '+' in every column is new against them all. A combined
+# header that names no parent is not a hunk anyone can read: the push fails
+# closed instead. A diff-tree --stdin patch carries a commit's id before its
+# diff; the id names the commit in what the hook says. Added lines are not
+# searched here: they are written down for check_added.
+collect_patch() {
+  about=${2:-the uncommitted diff}
+  file=
+  left=0
+  cc=0
+  parents=0
+  while IFS= read -r line || [ -n "$line" ]; do
+    if [ "$left" -gt 0 ]; then
+      if [ "$cc" -eq 1 ]; then
+        case "$line" in
+          '\'*) continue ;;
+        esac
+        pre=$(printf '%.*s' "$parents" "$line")
+        case "$pre" in
+          *-*) continue ;;
+          *' '*)
+            left=$((left - 1))
+            ;;
+          *)
+            left=$((left - 1))
+            case "$file" in
+              ''|/dev/null) ;;
+              *) skip_file "$file" || add_line "$file" "${line#"$pre"}" ;;
+            esac
+            ;;
+        esac
+        continue
+      fi
+      case "$line" in
+        '\'*) continue ;;
+        '-'*) continue ;;
+        '+'*)
+          text=${line#+}
+          case "$file" in
+            ''|/dev/null) ;;
+            *) skip_file "$file" || add_line "$file" "$text" ;;
+          esac
+          left=$((left - 1))
+          ;;
+        *)
+          left=$((left - 1))
+          ;;
+      esac
+      continue
+    fi
+    case "$line" in
+      'diff --git '*)
+        file=
+        cc=0
+        ;;
+      'diff --cc '*)
+        cc=1
+        file=${line#diff --cc }
+        case "$file" in
+          *' b/'*) file=${file##* b/} ;;
+          'a/'*) file=${file#a/} ;;
+        esac
+        ;;
+      '+++ '*)
+        file=${line#+++ }
+        case "$file" in
+          '"'*) file=${file#\"}; file=${file%\"} ;;
+        esac
+        file=${file#b/}
+        ;;
+      '@@@'*)
+        cc=1
+        parents=0
+        left=1
+        rest=${line#"${line%%[!@]*}"}
+        rest=${rest%%@*}
+        for word in $rest; do
+          case "$word" in
+            -*) parents=$((parents + 1)) ;;
+            +*)
+              count=${word#+}
+              case "$count" in
+                *,*) count=${count#*,} ;;
+                *) count=1 ;;
+              esac
+              case "$count" in
+                *[!0-9]*|'') count=0 ;;
+              esac
+              left=$count
+              ;;
+          esac
+        done
+        if [ "$parents" -eq 0 ]; then
+          reject "unreadable merge diff in $about"
+        fi
+        ;;
+      '@@'*)
+        cc=0
+        left=$(hunk_new_lines "$line")
+        ;;
+      *[!0-9a-f]*|'') ;;
+      *) about=$line ;;
+    esac
+  done < "$1" 3>> "$addf" 4>> "$addt"
+}
+
+git diff -U0 --diff-filter=ACMR -- . ":(exclude)$self" ":(exclude)$listfile" > "$patch"
+collect_patch "$patch"
+git diff --cached -U0 --diff-filter=ACMR -- . ":(exclude)$self" ":(exclude)$listfile" > "$patch"
+collect_patch "$patch"
+git ls-files --others --exclude-standard > "$paths"
+while IFS= read -r file; do
+  [ -n "$file" ] || continue
+  skip_file "$file" && continue
+  [ -f "$file" ] || continue
+  scan_file "$file"
+done < "$paths"
+
+mails=$(dirname "$(readlink -f "$0")")/commit-traces
+
+# Every commit the push adds is checked on its own: commits already on the
+# remote you push to (its remote-tracking refs; fetch first) are not checked
+# again, and a push to a URL, or a remote with no tracking refs, checks
+# everything the remote tip does not already hold. The commits of all the
+# pushed refs are one selection, so a commit several refs share is checked
+# once. A plain commit is scanned through its own patch, a root commit against
+# the empty tree; a merge is scanned through its combined diff, which holds
+# only the conflict resolution, beside the patches of the commits it carries.
+if [ -n "$range" ]; then
+  sh "$mails" mails $range
+  git rev-list --parents $range > "$all" || search_failed
+  awk -v plain="$plain" -v merges="$merges" '{ print $1 > (NF > 2 ? merges : plain) }' "$all"
+  git diff-tree --stdin -p -U0 --root --no-ext-diff --no-color -M --diff-filter=ACMRT -- . ":(exclude)$self" ":(exclude)$listfile" < "$plain" > "$patch" || search_failed
+  collect_patch "$patch"
+  git diff-tree --stdin --cc -U0 --no-ext-diff --no-color -- . ":(exclude)$self" ":(exclude)$listfile" < "$merges" > "$patch" || search_failed
+  collect_patch "$patch"
+fi
+check_added
